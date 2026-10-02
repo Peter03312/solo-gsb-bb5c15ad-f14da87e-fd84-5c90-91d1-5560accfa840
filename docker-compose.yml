@@ -1,0 +1,25 @@
+services:
+  flood-warning:
+    build: .
+    image: flood-warning-service
+    container_name: flood-warning
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件路径（容器内）
+      FLOOD_DB_PATH: /data/flood.db
+      # 水位合法范围（超出即 400）
+      FLOOD_MIN_WATER_LEVEL: "-50"
+      FLOOD_MAX_WATER_LEVEL: "1000"
+      # 裁定规则参数（默认值即规范值，可按需覆盖）
+      FLOOD_SEGMENT_GAP_MINUTES: "15"
+      FLOOD_RISE_MIN_COUNT: "3"
+      FLOOD_RISE_MIN_SPAN_MINUTES: "10"
+      FLOOD_CLEAR_MIN_COUNT: "2"
+      FLOOD_CLEAR_MIN_SPAN_MINUTES: "5"
+    volumes:
+      - flood-data:/data
+    restart: unless-stopped
+
+volumes:
+  flood-data:
