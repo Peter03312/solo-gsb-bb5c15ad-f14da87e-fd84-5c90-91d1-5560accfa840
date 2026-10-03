@@ -1515,3 +1515,334 @@ def test_replay_one_event_max_per_tick_even_if_count_crosses_twice_logically():
     # 初始 3、4 预警（<3? 等于2 < 3）→ 正常；t=10 合并后 {1,2,4} = 3 → 一个预警
     assert [e.type for e in res.events] == ["warning"]
     assert res.events[0].warning_station_ids == (1, 2, 4)
+
+
+# ---------------------------------------------------------------- 受控发布（核对 → 确认）
+
+def check(client):
+    r = client.post("/publish/checks")
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def confirm(client, token, note=None):
+    body = {"token": token}
+    if note is not None:
+        body["note"] = note
+    return client.post("/publish/confirm", json=body)
+
+
+def test_check_first_publish_against_empty_snapshot(client, station, device):
+    _make_warning(client, device)
+    d = check(client)
+    # 首次发布以空快照为基准
+    assert d["baseline_publication_id"] is None
+    assert d["baseline_published_at"] is None
+    assert len(d["token"]) >= 20
+    s = d["stations"][0]
+    assert s["station_id"] == station
+    assert s["status_before"] is None
+    assert s["status_after"] == "warning"
+    assert s["changed"] is True
+    assert s["new_object"] is True
+    # 空基准下既有预警事件全部计为新增
+    assert [e["type"] for e in s["events_added"]] == ["warning"]
+    assert s["events_added"][0]["occurrence"] == 1
+    assert s["events_removed"] == []
+    assert d["summary"]["stations_total"] == 1
+    assert d["summary"]["events_added"]["station_warning"] == 1
+    # 核对不产生发布：公开查询仍无结果
+    assert client.get("/public/current").status_code == 404
+
+
+def test_confirm_freezes_and_returns_publication_id(client, station, device):
+    _make_warning(client, device)
+    d = check(client)
+    r = confirm(client, d["token"], note="值班确认发布")
+    assert r.status_code == 201, r.text
+    pub_id = r.json()["publication_id"]
+    assert isinstance(pub_id, int)
+    assert r.json()["note"] == "值班确认发布"
+    # 公开结果已冻结为核对时的待发布结果（预警）
+    pub = client.get("/public/current").json()
+    assert pub["publication_id"] == pub_id
+    assert pub["timelines"][0]["status"] == "warning"
+
+
+def test_confirm_unknown_token_404(client, station):
+    r = confirm(client, "not-a-real-token")
+    assert r.status_code == 404
+
+
+def test_confirm_token_single_use(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    assert confirm(client, token).status_code == 201
+    # 同一凭证第二次确认 → 409，不产生新发布
+    r2 = confirm(client, token)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "token_already_used"
+    pubs = client.get("/publications").json()
+    assert len(pubs) == 1
+
+
+def test_check_status_before_after_and_events(client, station, device):
+    _make_warning(client, device)
+    # 第一次受控发布：预警
+    d1 = check(client)
+    confirm(client, d1["token"])
+    # 补传解除读数 → 待发布解除
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)
+    assert timeline(client, station)["status"] == "normal"
+
+    d2 = check(client)
+    assert d2["baseline_publication_id"] is not None
+    s = d2["stations"][0]
+    assert s["status_before"] == "warning"
+    assert s["status_after"] == "normal"
+    assert s["changed"] is True
+    assert s["new_object"] is False
+    # 相对基准：新增 cleared，原 warning 仍在（不消失）
+    assert [e["type"] for e in s["events_added"]] == ["cleared"]
+    assert s["events_removed"] == []
+    assert d2["summary"]["events_added"]["station_cleared"] == 1
+    confirm(client, d2["token"])
+
+    # 作废触发解除的读数之一（读数 4）：预警事件仍在，cleared 消失
+    client.post("/readings/4/void", json={"reason": "误报"})
+    d3 = check(client)
+    s = d3["stations"][0]
+    assert s["status_before"] == "normal"
+    assert s["status_after"] == "warning"
+    assert s["events_added"] == []
+    assert [e["type"] for e in s["events_removed"]] == ["cleared"]
+    assert s["events_removed"][0]["occurrence"] == 1
+
+
+def test_event_occurrence_distinguishes_repeated_events(client, station, device):
+    # 首次发布时仅预警；发布后解除 → 再次预警：第二次核对含 cleared#1 与 warning#2
+    _make_warning(client, device)                       # warning @10
+    d1 = check(client)
+    confirm(client, d1["token"])
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)                 # cleared @21
+    upload(client, device, 6, 30, 12.0)
+    upload(client, device, 7, 35, 12.0)
+    upload(client, device, 8, 40, 12.0)                # warning @40
+    d2 = check(client)
+    added = {(e["type"], e["occurrence"]) for e in d2["stations"][0]["events_added"]}
+    assert ("cleared", 1) in added
+    assert ("warning", 2) in added
+    # 首次发布已含 warning#1，本次不再重复计入
+    assert ("warning", 1) not in added
+
+
+@pytest.mark.parametrize(
+    "invalidate",
+    [
+        "reading",
+        "correct",
+        "void",
+        "threshold",
+        "zone",
+        "station",
+        "device",
+    ],
+)
+def test_confirm_rejected_after_affecting_write(client, station, device, invalidate):
+    _make_warning(client, device)
+    token = check(client)["token"]
+
+    if invalidate == "reading":
+        upload(client, device, 4, 30, 11.0)
+    elif invalidate == "correct":
+        client.post("/readings/1/correct", json={"water_level": 9.0, "reason": "比测"})
+    elif invalidate == "void":
+        client.post("/readings/1/void", json={"reason": "故障"})
+    elif invalidate == "threshold":
+        client.post(
+            f"/stations/{station}/threshold-versions",
+            json={
+                "effective_at": "2026-09-30T00:00:00Z",
+                "rise_threshold": 9.0,
+                "clear_threshold": 7.0,
+                "reason": "提级",
+            },
+        )
+    elif invalidate == "zone":
+        client.post(
+            "/zones",
+            json={
+                "name": "片区",
+                "effective_at": "2026-09-30T00:00:00Z",
+                "station_ids": [station],
+                "trigger_count": 1,
+            },
+        )
+    elif invalidate == "station":
+        client.post("/stations", json={"name": "新站", "rise_threshold": 10.0, "clear_threshold": 8.0})
+    elif invalidate == "device":
+        client.post(f"/stations/{station}/devices", json={"device_no": "DEV-002"})
+
+    r = confirm(client, token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "data_changed_after_check"
+    # 拒绝后无发布记录产生，凭证不可恢复使用
+    assert client.get("/public/current").status_code == 404
+    assert confirm(client, token).status_code in (409,)
+
+
+def test_confirm_rejected_when_another_publication_completed_first(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    # 另一发布先完成（直接发布接口保持可用）
+    client.post("/publish", json={"note": "抢先发布"})
+    r = confirm(client, token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "data_changed_after_check"
+    # 仅存在抢先发布一条记录
+    assert len(client.get("/publications").json()) == 1
+
+
+def test_idempotent_retry_does_not_invalidate_token(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    # 同设备同序号同内容重试：不改变数据，凭证仍可确认
+    r = client.post(
+        "/readings",
+        json={
+            "device_no": device,
+            "seq": 1,
+            "observed_at": iso(BASE + timedelta(minutes=0)),
+            "water_level": 12.0,
+        },
+    )
+    assert r.status_code == 200 and r.json()["deduplicated"] is True
+    assert confirm(client, token).status_code == 201
+
+
+def test_preview_does_not_invalidate_token(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    r = client.post(
+        f"/stations/{station}/threshold-versions/preview",
+        json={
+            "effective_at": "2026-09-30T00:00:00Z",
+            "rise_threshold": 9.0,
+            "clear_threshold": 7.0,
+            "reason": "预演",
+        },
+    )
+    assert r.status_code == 200 and r.json()["dry_run"] is True
+    assert confirm(client, token).status_code == 201
+
+
+def test_zone_diffs_in_check(client, station, device):
+    # 第二站 + K=1 责任区，区域随站预警
+    sid2 = client.post("/stations", json={"name": "乙站", "rise_threshold": 10.0, "clear_threshold": 8.0}).json()["id"]
+    client.post(f"/stations/{sid2}/devices", json={"device_no": "DEV-009"})
+    zid = client.post(
+        "/zones",
+        json={"name": "片区", "effective_at": "2026-09-30T00:00:00Z", "station_ids": [station, sid2], "trigger_count": 1},
+    ).json()["id"]
+    _make_warning(client, device)
+
+    d = check(client)
+    z = d["zones"][0]
+    assert z["zone_id"] == zid
+    assert z["status_before"] is None
+    assert z["status_after"] == "warning"
+    assert z["new_object"] is True
+    assert z["events_added"][0]["type"] == "warning"
+    zd = next(e for e in d["events_added"] if e["object_type"] == "zone")
+    assert zd["object_id"] == zid and zd["occurrence"] == 1
+    confirm(client, d["token"])
+
+    # 补解除读数后区域解除
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)
+    d2 = check(client)
+    z2 = d2["zones"][0]
+    assert z2["status_before"] == "warning"
+    assert z2["status_after"] == "normal"
+    assert [e["type"] for e in z2["events_added"]] == ["cleared"]
+
+
+def test_check_and_confirm_empty_system(client):
+    # 无任何站点也可核对（空快照 vs 空待发布）并成功发布
+    d = check(client)
+    assert d["stations"] == [] and d["zones"] == []
+    assert d["summary"]["stations_total"] == 0
+    r = confirm(client, d["token"], note="空发布")
+    assert r.status_code == 201
+    assert r.json()["stations"] == [] and r.json()["zones"] == []
+    assert client.get("/public/current").status_code == 200
+
+
+def test_rejected_confirm_creates_no_publication_row(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    upload(client, device, 4, 30, 11.0)
+    r = confirm(client, token)
+    assert r.status_code == 409
+    assert client.get("/publications").json() == []
+    # 作废后再次核对可拿到新凭证正常发布
+    d2 = check(client)
+    assert d2["token"] != token
+    assert confirm(client, d2["token"]).status_code == 201
+
+
+def test_confirm_requires_token_field(client):
+    r = client.post("/publish/confirm", json={})
+    assert r.status_code == 400
+    r2 = client.post("/publish/confirm", json={"token": ""})
+    assert r2.status_code == 400
+
+
+def test_frozen_content_matches_check_pending(client, station, device):
+    _make_warning(client, device)
+    d = check(client)
+    pending_events = timeline(client, station)["events"]
+    confirm(client, d["token"])
+    frozen = client.get(f"/public/stations/{station}/timeline").json()
+    assert frozen["status"] == "warning"
+    assert frozen["events"] == pending_events
+    # 历史快照不得被之后发布改写
+    pub1 = client.get("/public/current").json()["publication_id"]
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)
+    d3 = check(client)
+    confirm(client, d3["token"])
+    old = client.get(f"/publications/{pub1}").json()
+    assert old["timelines"][0]["status"] == "warning"
+    assert client.get("/public/current").json()["timelines"][0]["status"] == "normal"
+
+
+def test_concurrent_confirm_same_token_only_one_succeeds(client, station, device):
+    _make_warning(client, device)
+    token = check(client)["token"]
+    results = []
+
+    def worker():
+        results.append(confirm(client, token).status_code)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert sorted(results) == [201, 409]
+    assert len(client.get("/publications").json()) == 1
+
+
+def test_check_data_version_advances(client, station, device):
+    v0 = check(client)["data_version"]  # 已含登记站点 + 设备的 2 次版本推进
+    _make_warning(client, device)       # 3 条新读数 → 版本再 +3
+    d2 = check(client)
+    assert d2["data_version"] == v0 + 3
+    r = confirm(client, d2["token"])
+    assert r.json()["data_version"] == v0 + 4
+    # 发布本身也推进数据版本
+    d3 = check(client)
+    assert d3["data_version"] == v0 + 4
+    assert d3["baseline_publication_id"] is not None

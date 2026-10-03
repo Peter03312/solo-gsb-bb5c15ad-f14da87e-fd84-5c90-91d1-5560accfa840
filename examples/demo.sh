@@ -272,5 +272,54 @@ echo "登记后区域 3: $(curl -s "$BASE/zones/3/timeline" \
   | python3 -c 'import sys,json;z=json.load(sys.stdin);print(z["status"], [(e["type"],e["at"]) for e in z["events"]])')"
 echo "（状态/事件类型/时刻与步骤 30 预演一致；预演的临时版本 id -1 已换为正式版本 id）"
 
+# ---------------------------------------------------------------
+# 值班员受控发布：核对 → 凭一次性凭证确认（异常路径演示）
+# ---------------------------------------------------------------
+
+step "35. 发布前核对：待发布相对最新公开快照的基准发布号、状态前后值、新增/消失事件、确认凭证"
+CHECK=$(curl -s -X POST "$BASE/publish/checks")
+echo "$CHECK" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("基准发布号:", d["baseline_publication_id"], "| 数据版本:", d["data_version"])
+def ev(e):
+    return (e["type"], e["at"], e["occurrence"])
+for s in d["stations"]:
+    if s["changed"] or s["new_object"]:
+        added = [ev(e) for e in s["events_added"]]
+        removed = [ev(e) for e in s["events_removed"]]
+        print("  站%s: %s -> %s 新增 %s 消失 %s"
+              % (s["station_id"], s["status_before"], s["status_after"], added, removed))
+for z in d["zones"]:
+    if z["changed"] or z["new_object"]:
+        added = [e["type"] for e in z["events_added"]]
+        removed = [e["type"] for e in z["events_removed"]]
+        print("  区域%s: %s -> %s 新增 %s 消失 %s"
+              % (z["zone_id"], z["status_before"], z["status_after"], added, removed))
+print("  汇总:", d["summary"])
+print("  确认凭证:", d["token"][:16] + "...")
+'
+TOKEN=$(echo "$CHECK" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+step "36. 核对后补传读数 → 再确认被拒绝（409，且不生成发布记录）"
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-007","seq":799,"observed_at":"2026-10-01T12:30:00+08:00","water_level":12.0}' > /dev/null
+curl -s -w ' [HTTP %{http_code}]\n' -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"token\":\"$TOKEN\",\"note\":\"变更后确认应被拒绝\"}"
+echo "公开最新发布号仍为: $(curl -s "$BASE/public/current" | python3 -c 'import sys,json;print(json.load(sys.stdin)["publication_id"])')"
+
+step "37. 重新核对拿新凭证 → 确认成功，返回新发布编号"
+TOKEN2=$(curl -s -X POST "$BASE/publish/checks" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"token\":\"$TOKEN2\",\"note\":\"值班员核对后受控发布\"}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("受控发布成功，发布号:",d["publication_id"],"| 备注:",d["note"])'
+
+step "38. 凭证一次性：同一凭证再次确认 → 409；未知凭证 → 404"
+curl -s -w '重复确认 → HTTP %{http_code}\n' -o /dev/null -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"token\":\"$TOKEN2\"}"
+curl -s -w '未知凭证 → HTTP %{http_code}\n' -o /dev/null -X POST "$BASE/publish/confirm" -H "$J" \
+  -d '{"token":"not-a-real-token"}'
+echo "历史快照数（不受受控发布影响，仅新增不改写）: $(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"

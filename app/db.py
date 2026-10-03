@@ -105,6 +105,33 @@ CREATE TABLE IF NOT EXISTS publication_zones (
     timeline_json  TEXT NOT NULL,               -- 发布时冻结的区域联动时间线
     PRIMARY KEY (publication_id, zone_id)
 );
+
+-- 应用元数据：data_version 为影响裁定的写入累计版本号（单调递增），
+-- 受控发布在确认时用它判断“核对后”是否发生过站点/设备/读数/阈值/责任区/发布写入。
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- 受控发布核对凭证（POST /publish/checks）：一次核对一行，确认成功后标记 used。
+-- data_version 记录核对时的数据版本；任何影响裁定的写入都会推进 data_version，
+-- 使旧凭证在确认时以 409 作废。
+CREATE TABLE IF NOT EXISTS publish_checks (
+    token_hash    TEXT PRIMARY KEY,             -- 确认凭证（仅存其 SHA-256 哈希）
+    publication_id INTEGER,                     -- 核对时基准发布 id（首次发布为 NULL）
+    data_version  INTEGER NOT NULL,             -- 核对时的数据版本
+    pending_digest TEXT NOT NULL,               -- 核对时待发布结果的规范化摘要
+    note          TEXT,                         -- 核对时附带的备注（预留）
+    used          INTEGER NOT NULL DEFAULT 0,   -- 0=待确认，1=已成功使用（凭证一次性）
+    voided        INTEGER NOT NULL DEFAULT 0,   -- 1=核对后数据变化/他发布导致作废
+    created_at    TEXT NOT NULL,
+    confirmed_at  TEXT,                         -- 成功确认时间
+    confirmed_publication_id INTEGER            -- 成功确认生成的发布 id
+);
+"""
+
+META_INIT = """
+INSERT OR IGNORE INTO app_meta(key, value) VALUES ('data_version', '0');
 """
 
 
@@ -122,6 +149,7 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._conn.execute(META_INIT)
 
     @contextmanager
     def write_tx(self) -> Iterator[sqlite3.Connection]:
