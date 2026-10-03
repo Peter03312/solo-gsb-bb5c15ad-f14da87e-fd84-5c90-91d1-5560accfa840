@@ -105,6 +105,30 @@ CREATE TABLE IF NOT EXISTS publication_zones (
     timeline_json  TEXT NOT NULL,               -- 发布时冻结的区域联动时间线
     PRIMARY KEY (publication_id, zone_id)
 );
+
+-- 单行元数据表：adjudication_version 为“裁定数据版本号”。
+-- 任何影响待发布裁定的写入（站点/设备/读数补传/作废更正/阈值版本/责任区登记/发布）
+-- 都在其写事务内将该值 +1；受控发布的确认凭证据此判断核对后数据是否发生变化。
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO app_meta(key, value) VALUES ('adjudication_version', '0');
+
+-- 受控发布（核对 → 确认）凭证：核对时写入，确认成功后置为 confirmed。
+-- 一个凭证只能成功确认一次；status 仍为 open 但版本/基准/指纹对不上时确认拒绝。
+CREATE TABLE IF NOT EXISTS release_confirmations (
+    token                    TEXT PRIMARY KEY,
+    status                   TEXT NOT NULL,     -- open | confirmed
+    baseline_publication_id  INTEGER,           -- 核对时的最新发布编号（首次发布为 NULL）
+    adjudication_version     INTEGER NOT NULL,  -- 核对时的裁定数据版本号
+    checked_at               TEXT NOT NULL,
+    result_json              TEXT NOT NULL,     -- 核对结果完整快照（响应体）
+    pending_fingerprint      TEXT NOT NULL,     -- 核对时待发布冻结内容指纹
+    note                     TEXT,              -- 确认时附的备注
+    confirmed_publication_id INTEGER,           -- 确认成功生成的发布编号
+    confirmed_at             TEXT
+);
 """
 
 
@@ -140,6 +164,28 @@ class Database:
     def read(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             yield self._conn
+
+    def bump_adjudication_version(self, conn: sqlite3.Connection) -> int:
+        """在当前写事务内推进裁定数据版本号并返回推进后的值。
+
+        必须在 write_tx() 的连接上调用；调用方事务回滚时版本推进一并回滚。
+        """
+        cur = conn.execute(
+            """
+            UPDATE app_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            WHERE key='adjudication_version'
+            """
+        )
+        assert cur.rowcount == 1
+        row = conn.execute(
+            "SELECT CAST(value AS INTEGER) AS v FROM app_meta WHERE key='adjudication_version'"
+        ).fetchone()
+        return row["v"]
+
+    def adjudication_version(self, conn: sqlite3.Connection) -> int:
+        return conn.execute(
+            "SELECT CAST(value AS INTEGER) AS v FROM app_meta WHERE key='adjudication_version'"
+        ).fetchone()["v"]
 
     def close(self) -> None:
         with self._lock:

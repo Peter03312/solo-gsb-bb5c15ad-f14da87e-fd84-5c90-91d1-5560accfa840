@@ -1515,3 +1515,313 @@ def test_replay_one_event_max_per_tick_even_if_count_crosses_twice_logically():
     # 初始 3、4 预警（<3? 等于2 < 3）→ 正常；t=10 合并后 {1,2,4} = 3 → 一个预警
     assert [e.type for e in res.events] == ["warning"]
     assert res.events[0].warning_station_ids == (1, 2, 4)
+
+
+# ---------------------------------------------------------------- 受控发布（核对 → 确认）
+
+def reconcile(client):
+    r = client.post("/publish/reconcile")
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def z(minutes):
+    """API 事件时间统一以 Z 结尾（UTC）。"""
+    return (BASE + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+
+def confirm(client, token, note=None):
+    body = {"confirmation_token": token}
+    if note is not None:
+        body["note"] = note
+    return client.post("/publish/confirm", json=body)
+
+
+def make_warning_station(client, name="甲站", device_no="D1"):
+    sid, dev = make_station_with_device(client, name, device_no)
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, dev, i, m, 12.0)
+    assert timeline(client, sid)["status"] == "warning"
+    return sid, dev
+
+
+def test_reconcile_first_release_uses_empty_snapshot(client):
+    sid, _ = make_warning_station(client)
+    rec = reconcile(client)
+    assert rec["baseline_publication_id"] is None
+    entry = rec["stations"][0]
+    assert entry["station_id"] == sid
+    assert entry["baseline_status"] is None
+    assert entry["pending_status"] == "warning"
+    assert entry["new_object"] is True
+    ev = entry["added_events"][0]
+    assert ev == {"type": "warning", "at": z(10), "occurrence_count": 3}
+    assert entry["disappeared_events"] == []
+    assert rec["summary"] == {
+        "station_count": 1,
+        "zone_count": 0,
+        "new_station_ids": [sid],
+        "new_zone_ids": [],
+        "stations_changed": 1,
+        "zones_changed": 0,
+        "added_event_count": 1,
+        "disappeared_event_count": 0,
+        "has_changes": True,
+    }
+    assert rec["confirmation_token"]
+
+
+def test_reconcile_empty_system_first_release(client):
+    rec = reconcile(client)
+    assert rec["baseline_publication_id"] is None
+    assert rec["stations"] == [] and rec["zones"] == []
+    assert rec["summary"]["has_changes"] is False
+    r = confirm(client, rec["confirmation_token"], note="空首发")
+    assert r.status_code == 201
+    assert r.json()["publication_id"] == 1
+    assert r.json()["baseline_publication_id"] is None
+    assert client.get("/public/current").status_code == 200
+
+
+def test_confirm_first_release_freezes_and_succeeds_once(client):
+    sid, _ = make_warning_station(client)
+    token = reconcile(client)["confirmation_token"]
+    r = confirm(client, token, note="首次受控发布")
+    assert r.status_code == 201
+    assert r.json()["publication_id"] == 1
+    assert r.json()["stations"][0]["status"] == "warning"
+    assert r.json()["note"] == "首次受控发布"
+    assert client.get("/public/stations/1/timeline").json()["status"] == "warning"
+    # 凭证只能成功使用一次
+    r2 = confirm(client, token)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "token_used"
+    # 未新增发布记录
+    assert [p["publication_id"] for p in client.get("/publications").json()] == [1]
+
+
+def test_confirm_invalid_token_rejected(client):
+    r = confirm(client, "definitely-not-a-real-token")
+    assert r.status_code == 400
+    assert r.json()["detail"]["reason"] == "invalid_token"
+    r = client.post("/publish/confirm", json={})
+    assert r.status_code == 400
+
+
+def test_reconcile_detects_status_change_and_added_cleared_event(client):
+    sid, dev = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])
+    upload(client, dev, 4, 15, 7.0)
+    upload(client, dev, 5, 21, 7.0)
+    rec = reconcile(client)
+    assert rec["baseline_publication_id"] == 1
+    entry = rec["stations"][0]
+    assert entry["new_object"] is False
+    assert entry["baseline_status"] == "warning"
+    assert entry["pending_status"] == "normal"
+    assert entry["added_events"] == [
+        {"type": "cleared", "at": z(21), "occurrence_count": 2}
+    ]
+    assert entry["disappeared_events"] == []
+
+
+def test_reconcile_detects_disappeared_events_after_void(client):
+    sid, dev = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])
+    rid = client.get(f"/stations/{sid}/readings").json()[-1]["id"]
+    client.post(f"/readings/{rid}/void", json={"reason": "误报剔除"})
+    entry = reconcile(client)["stations"][0]
+    assert entry["baseline_status"] == "warning"
+    assert entry["pending_status"] == "normal"
+    assert entry["added_events"] == []
+    assert entry["disappeared_events"] == [
+        {"type": "warning", "at": z(10), "occurrence_count": 3}
+    ]
+
+
+def test_reconcile_zone_diff_occurrence_count_is_warning_station_count(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    rec = reconcile(client)
+    zone = rec["zones"][0]
+    assert zone["new_object"] is True
+    assert zone["added_events"] == [
+        {"type": "warning", "at": z(10), "occurrence_count": 2}
+    ]
+    confirm(client, rec["confirmation_token"])
+
+    # 作废乙站两条关键读数 → 其预警与区域预警同时从待发布结果消失
+    rids = [r["id"] for r in client.get(f"/stations/{s2}/readings").json()]
+    client.post(f"/readings/{rids[-1]}/void", json={"reason": "x"})
+    client.post(f"/readings/{rids[-2]}/void", json={"reason": "x"})
+    rec2 = reconcile(client)
+    assert rec2["zones"][0]["disappeared_events"] == [
+        {"type": "warning", "at": z(10), "occurrence_count": 2}
+    ]
+    st2 = [e for e in rec2["stations"] if e["station_id"] == s2][0]
+    assert st2["disappeared_events"][0]["type"] == "warning"
+
+
+def test_newly_registered_station_compared_against_empty_baseline(client):
+    sid, _ = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    rec = reconcile(client)
+    e1 = [e for e in rec["stations"] if e["station_id"] == sid][0]
+    e2 = [e for e in rec["stations"] if e["station_id"] == s2][0]
+    assert e1["new_object"] is False
+    assert e1["baseline_status"] == "warning"
+    assert e2["new_object"] is True
+    assert e2["baseline_status"] is None
+    assert e2["pending_status"] == "normal"
+    assert rec["summary"]["new_station_ids"] == [s2]
+
+
+def test_confirm_rejected_after_reading_upload(client):
+    reconcile_first = reconcile(client)
+    confirm(client, reconcile_first["confirmation_token"])
+    sid, dev = make_station_with_device(client, "甲站", "D1")
+    rec = reconcile(client)
+    upload(client, dev, 1, 0, 12.0)
+    r = confirm(client, rec["confirmation_token"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "stale_confirmation"
+    assert [p["publication_id"] for p in client.get("/publications").json()] == [1]
+
+
+def test_confirm_rejected_after_revision_threshold_zone_device_station_writes(client):
+    sid, dev = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])
+
+    # 审核更正
+    token = reconcile(client)["confirmation_token"]
+    rid = client.get(f"/stations/{sid}/readings").json()[0]["id"]
+    client.post(f"/readings/{rid}/correct", json={"water_level": 11.0, "reason": "修正"})
+    assert confirm(client, token).status_code == 409
+
+    # 阈值版本登记
+    token = reconcile(client)["confirmation_token"]
+    r = client.post(
+        f"/stations/{sid}/threshold-versions",
+        json={"effective_at": iso(BASE), "rise_threshold": 9.0,
+              "clear_threshold": 7.0, "reason": "入汛提级"},
+    )
+    assert r.status_code == 201
+    assert confirm(client, token).status_code == 409
+
+    # 责任区登记
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    token = reconcile(client)["confirmation_token"]
+    create_zone(client, [sid, s2], 0, 2)
+    assert confirm(client, token).status_code == 409
+
+    # 设备登记
+    token = reconcile(client)["confirmation_token"]
+    r = client.post(f"/stations/{s2}/devices", json={"device_no": "D2-NEW"})
+    assert r.status_code == 201
+    assert confirm(client, token).status_code == 409
+
+    # 监测站登记
+    token = reconcile(client)["confirmation_token"]
+    r = client.post("/stations", json={"name": "丙站", "rise_threshold": 10.0, "clear_threshold": 8.0})
+    assert r.status_code == 201
+    assert confirm(client, token).status_code == 409
+
+    # 作废
+    token = reconcile(client)["confirmation_token"]
+    client.post(f"/readings/{rid}/void", json={"reason": "剔除"})
+    assert confirm(client, token).status_code == 409
+
+    assert [p["publication_id"] for p in client.get("/publications").json()] == [1]
+
+
+def test_confirm_rejected_after_other_publication(client):
+    sid, _ = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])  # 发布 1
+    token = reconcile(client)["confirmation_token"]
+    r = client.post("/publish", json={"note": "抢先发布"})
+    assert r.status_code == 201
+    r = confirm(client, token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "stale_confirmation"
+
+
+def test_idempotent_duplicate_upload_does_not_invalidate_token(client):
+    sid, dev = make_warning_station(client)
+    rec = reconcile(client)
+    # 同设备 + 同序号 + 同内容重试：200 幂等，不推进裁定版本
+    r = upload(client, dev, 1, 0, 12.0)
+    assert r.status_code == 200 and r.json()["deduplicated"] is True
+    r = confirm(client, rec["confirmation_token"], note="ok")
+    assert r.status_code == 201
+    assert r.json()["publication_id"] == 1
+
+
+def test_confirmed_freeze_equals_reconciled_pending_result(client):
+    sid, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [sid, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    rec = reconcile(client)
+    token = rec["confirmation_token"]
+    pub_id = confirm(client, token).json()["publication_id"]
+
+    pub = client.get(f"/publications/{pub_id}").json()
+    frozen_station = pub["timelines"][0]
+    # 冻结内容即核对时的待发布结果（状态、事件时刻/类型/出现次数）
+    assert frozen_station["status"] == "warning"
+    assert [(e["type"], e["at"], e["run_count"]) for e in frozen_station["events"]] == [
+        ("warning", z(10), 3)
+    ]
+    frozen_zone = pub["zone_timelines"][0]
+    assert [(e["type"], e["at"], e["warning_station_count"]) for e in frozen_zone["events"]] == [
+        ("warning", z(10), 2)
+    ]
+    # 与当时待发布查询一致
+    ztl = zone_timeline(client, 1)
+    assert frozen_zone["status"] == ztl["status"]
+    assert frozen_zone["events"] == ztl["events"]
+
+
+def test_concurrent_confirms_only_one_succeeds(client):
+    sid, _ = make_warning_station(client)
+    token = reconcile(client)["confirmation_token"]
+    results = []
+
+    def worker():
+        results.append(confirm(client, token).status_code)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert sorted(results) == [201, 409, 409, 409]
+    assert [p["publication_id"] for p in client.get("/publications").json()] == [1]
+
+
+def test_reconcile_does_not_invalidate_earlier_open_token(client):
+    sid, _ = make_warning_station(client)
+    t1 = reconcile(client)["confirmation_token"]
+    t2 = reconcile(client)["confirmation_token"]
+    # 两次核对均为只读计算 + 凭证落库，不推进裁定版本；较早凭证仍可确认
+    assert confirm(client, t1, note="用较早凭证").status_code == 201
+    # t1 的发布使 t2 失效
+    assert confirm(client, t2).status_code == 409
+
+
+def test_confirm_no_changes_release_is_allowed(client):
+    sid, _ = make_warning_station(client)
+    confirm(client, reconcile(client)["confirmation_token"])
+    rec = reconcile(client)
+    assert rec["summary"]["has_changes"] is False
+    assert rec["stations"][0]["baseline_status"] == rec["stations"][0]["pending_status"] == "warning"
+    r = confirm(client, rec["confirmation_token"], note="无变化发布")
+    assert r.status_code == 201
+    assert r.json()["publication_id"] == 2

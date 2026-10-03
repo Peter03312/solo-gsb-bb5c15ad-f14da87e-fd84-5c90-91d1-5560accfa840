@@ -64,6 +64,14 @@ class PublishRequest(BaseModel):
     note: Optional[str] = Field(default=None, max_length=500)
 
 
+class PublishConfirmRequest(BaseModel):
+    """受控发布确认：以核对返回的凭证为输入，备注可选。"""
+
+    model_config = ConfigDict(extra="ignore")
+    confirmation_token: str = Field(min_length=1, max_length=200, description="核对返回的确认凭证")
+    note: Optional[str] = Field(default=None, max_length=500, description="发布备注（可选）")
+
+
 class ThresholdVersionCreate(BaseModel):
     """防汛方案调整：登记某站的一版阈值（自生效时间起采用）。"""
 

@@ -272,5 +272,53 @@ echo "登记后区域 3: $(curl -s "$BASE/zones/3/timeline" \
   | python3 -c 'import sys,json;z=json.load(sys.stdin);print(z["status"], [(e["type"],e["at"]) for e in z["events"]])')"
 echo "（状态/事件类型/时刻与步骤 30 预演一致；预演的临时版本 id -1 已换为正式版本 id）"
 
+# ---------------------------------------------------------------
+# 受控发布（值班员核对 → 确认两阶段）
+# ---------------------------------------------------------------
+
+step "35. 受控发布·核对：以最新公开快照为基准，返回状态前后值、新增/消失事件与确认凭证"
+RECONCILE="$(curl -s -X POST "$BASE/publish/reconcile")"
+echo "$RECONCILE" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("基准发布编号:", d["baseline_publication_id"], "| 汇总:", json.dumps(d["summary"], ensure_ascii=False))
+for s in d["stations"]:
+    print("  站", s["station_id"], s["station_name"],
+          s["baseline_status"], "→", s["pending_status"],
+          "新增", s["added_events"], "消失", s["disappeared_events"])
+for z in d["zones"]:
+    print("  责任区", z["zone_id"], z["zone_name"],
+          z["baseline_status"], "→", z["pending_status"],
+          "新增", z["added_events"], "消失", z["disappeared_events"])
+'
+TOKEN="$(echo "$RECONCILE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirmation_token"])')"
+echo "确认凭证: $TOKEN"
+
+step "36. 核对后发生影响裁定的写入（补传读数）→ 确认被拒绝（409，不生成发布记录）"
+PUB_BEFORE="$(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-002","seq":99,"observed_at":"2026-10-01T09:20:00+08:00","water_level":9.5}' > /dev/null
+curl -s -w ' [HTTP %{http_code}]\n' -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"confirmation_token\":\"$TOKEN\",\"note\":\"过时凭证\"}"
+PUB_AFTER="$(curl -s "$BASE/publications" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
+echo "发布记录数 核对前/拒绝后: $PUB_BEFORE / $PUB_AFTER（应相同）"
+
+step "37. 无效凭证 → 400；重新核对后确认成功 → 201 返回发布编号；凭证再用 → 409"
+curl -s -w ' [HTTP %{http_code}]\n' -X POST "$BASE/publish/confirm" -H "$J" \
+  -d '{"confirmation_token":"这不是有效凭证"}'
+TOKEN="$(curl -s -X POST "$BASE/publish/reconcile" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirmation_token"])')"
+curl -s -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"confirmation_token\":\"$TOKEN\",\"note\":\"值班员受控发布\"}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("发布成功，发布编号:",d["publication_id"],"备注:",d["note"])'
+curl -s -w '重复使用凭证 [HTTP %{http_code}]\n' -o /dev/null -X POST "$BASE/publish/confirm" -H "$J" \
+  -d "{\"confirmation_token\":\"$TOKEN\"}"
+
+step "38. 冻结结果即核对时的待发布结果，历史快照不变"
+LATEST="$(curl -s "$BASE/public/current" | python3 -c 'import sys,json;print(json.load(sys.stdin)["publication_id"])')"
+echo "最新公开发布编号: $LATEST"
+echo "历史发布 1 仍为冻结时内容: $(curl -s "$BASE/publications/1" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print([(t["station_id"],t["status"]) for t in d["timelines"]])')"
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"

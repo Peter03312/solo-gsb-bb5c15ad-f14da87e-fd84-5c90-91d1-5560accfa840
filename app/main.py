@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import secrets
 import sqlite3
 from bisect import bisect_right
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -21,6 +24,7 @@ from .db import Database
 from .schemas import (
     CorrectRequest,
     DeviceCreate,
+    PublishConfirmRequest,
     PublishRequest,
     ReadingIngest,
     StationCreate,
@@ -113,8 +117,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.3.0",
-        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动与发布冻结。",
+        version="1.4.0",
+        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动、受控发布（核对→确认两阶段冻结）。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -427,6 +431,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "INSERT INTO stations(name, rise_threshold, clear_threshold, created_at) VALUES (?,?,?,?)",
                 (body.name, body.rise_threshold, body.clear_threshold, now),
             )
+            db.bump_adjudication_version(conn)
             row = conn.execute("SELECT * FROM stations WHERE id=?", (cur.lastrowid,)).fetchone()
         return {
             "id": row["id"],
@@ -482,6 +487,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 )
             except sqlite3.IntegrityError:
                 raise HTTPException(status_code=409, detail=f"设备号 {body.device_no} 已存在")
+            db.bump_adjudication_version(conn)
             row = conn.execute("SELECT * FROM devices WHERE id=?", (cur.lastrowid,)).fetchone()
         return {
             "id": row["id"],
@@ -549,6 +555,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     """,
                     (dev["id"], body.seq, obs_str, body.water_level, obs_str, body.water_level, now, now),
                 )
+                db.bump_adjudication_version(conn)
             except sqlite3.IntegrityError:
                 # 并发下唯一约束兜底：按已存在处理，重新读取后比较
                 existing = conn.execute(
@@ -612,6 +619,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "UPDATE readings SET status='voided', version=version+1, updated_at=? WHERE id=?",
                 (now, reading_id),
             )
+            db.bump_adjudication_version(conn)
             updated, _ = get_reading_or_404(conn, reading_id)
             station_id = conn.execute(
                 "SELECT station_id FROM devices WHERE id=?", (updated["device_id"],)
@@ -656,6 +664,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "UPDATE readings SET observed_at=?, water_level=?, version=version+1, updated_at=? WHERE id=?",
                 (new_obs, new_level, now, reading_id),
             )
+            db.bump_adjudication_version(conn)
             updated, _ = get_reading_or_404(conn, reading_id)
             station_id = conn.execute(
                 "SELECT station_id FROM devices WHERE id=?", (updated["device_id"],)
@@ -730,6 +739,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     """,
                     (station_id, eff_str, body.rise_threshold, body.clear_threshold, body.reason, now),
                 )
+                db.bump_adjudication_version(conn)
             except sqlite3.IntegrityError:
                 # 并发下唯一约束兜底
                 raise HTTPException(
@@ -894,6 +904,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "INSERT INTO zone_members(zone_id, station_id, position) VALUES (?,?,?)",
                     (zone_id, station_id, position),
                 )
+            db.bump_adjudication_version(conn)
             zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
             members = get_zone_members(conn, zone_id)
             timeline = compute_zone_timeline(conn, zone_id)
@@ -960,6 +971,228 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     # ------------------------------------------------------------ 发布（冻结公开结果）
 
+    def _station_event_keys(timeline: dict[str, Any]) -> list[tuple[str, str, int]]:
+        """单站事件多重集的键：(事件类型, 发生时刻, 出现次数)。
+
+        出现次数取触发事件的连续达阈值读数个数 run_count。
+        """
+        return [(e["type"], e["at"], e.get("run_count", 1)) for e in timeline["events"]]
+
+    def _zone_event_keys(timeline: dict[str, Any]) -> list[tuple[str, str, int]]:
+        """责任区事件多重集的键：(事件类型, 发生时刻, 出现次数)。
+
+        区域事件每个时刻至多一个，出现次数取事件发生时仍在预警的成员站数。
+        """
+        return [(e["type"], e["at"], e["warning_station_count"]) for e in timeline["events"]]
+
+    def _diff_event_lists(
+        baseline_keys: list[tuple[str, str, int]],
+        pending_keys: list[tuple[str, str, int]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """按 (事件类型, 发生时刻, 出现次数) 的多重集比对，返回 (新增, 消失) 事件。
+
+        多重集语义：同键出现 n 次则列出 n 条；结果按发生时刻、类型、出现次数排序。
+        """
+        base_counter: Counter = Counter(baseline_keys)
+        pending_counter: Counter = Counter(pending_keys)
+
+        def rows(counter: Counter) -> list[dict[str, Any]]:
+            out = [
+                {"type": ev_type, "at": at, "occurrence_count": occ}
+                for (ev_type, at, occ), count in counter.items()
+                for _ in range(count)
+            ]
+            out.sort(key=lambda e: (e["at"], e["type"], e["occurrence_count"]))
+            return out
+
+        return rows(pending_counter - base_counter), rows(base_counter - pending_counter)
+
+    def _compute_pending_payload(conn: sqlite3.Connection) -> dict[str, Any]:
+        """计算当前待发布冻结载荷（纯计算、不写库）。
+
+        载荷结构与实际冻结写入的 JSON 内容一致，供：
+        - 核对：与最新公开快照逐项比对；
+        - 确认：指纹复核后原样冻结，保证“冻结内容与核对时的待发布结果一致”。
+        """
+        stations_payload: list[dict[str, Any]] = []
+        for st in conn.execute("SELECT id FROM stations ORDER BY id").fetchall():
+            stations_payload.append(compute_timeline(conn, st["id"]))
+        zones_payload: list[dict[str, Any]] = []
+        for z in conn.execute("SELECT id FROM zones ORDER BY id").fetchall():
+            zones_payload.append(compute_zone_timeline(conn, z["id"]))
+        return {"stations": stations_payload, "zones": zones_payload}
+
+    def _freeze_payload(
+        conn: sqlite3.Connection, publication_id: int, payload: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """把给定待发布载荷冻结写入 publication_timelines / publication_zones。"""
+        station_summaries: list[dict[str, Any]] = []
+        for timeline in payload["stations"]:
+            conn.execute(
+                "INSERT INTO publication_timelines(publication_id, station_id, timeline_json) VALUES (?,?,?)",
+                (publication_id, timeline["station_id"], json.dumps(timeline, ensure_ascii=False)),
+            )
+            station_summaries.append(
+                {
+                    "station_id": timeline["station_id"],
+                    "station_name": timeline["station_name"],
+                    "status": timeline["status"],
+                    "event_count": len(timeline["events"]),
+                }
+            )
+        zone_summaries: list[dict[str, Any]] = []
+        for ztl in payload["zones"]:
+            conn.execute(
+                "INSERT INTO publication_zones(publication_id, zone_id, timeline_json) VALUES (?,?,?)",
+                (publication_id, ztl["zone_id"], json.dumps(ztl, ensure_ascii=False)),
+            )
+            zone_summaries.append(
+                {
+                    "zone_id": ztl["zone_id"],
+                    "zone_name": ztl["zone_name"],
+                    "status": ztl["status"],
+                    "event_count": len(ztl["events"]),
+                }
+            )
+        return station_summaries, zone_summaries
+
+    def _payload_fingerprint(payload: dict[str, Any]) -> str:
+        """待发布冻结内容指纹：规范化 JSON（键排序、紧凑分隔）后的 SHA-256。"""
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _load_baseline_snapshot(
+        conn: sqlite3.Connection,
+    ) -> tuple[Optional[int], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        """加载最新公开快照：(发布编号, {站id: 冻结时间线}, {责任区id: 冻结时间线})。
+
+        尚无任何发布时返回 (None, {}, {})，即首次发布/新对象的空基准。
+        """
+        pub = conn.execute("SELECT * FROM publications ORDER BY id DESC LIMIT 1").fetchone()
+        if pub is None:
+            return None, {}, {}
+        station_rows = conn.execute(
+            "SELECT station_id, timeline_json FROM publication_timelines WHERE publication_id=?",
+            (pub["id"],),
+        ).fetchall()
+        zone_rows = conn.execute(
+            "SELECT zone_id, timeline_json FROM publication_zones WHERE publication_id=?",
+            (pub["id"],),
+        ).fetchall()
+        return (
+            pub["id"],
+            {r["station_id"]: json.loads(r["timeline_json"]) for r in station_rows},
+            {r["zone_id"]: json.loads(r["timeline_json"]) for r in zone_rows},
+        )
+
+    def _build_reconcile_result(
+        conn: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """核对当前待发布裁定相对最新公开快照的变化。
+
+        返回 (核对结果响应体, 待发布冻结载荷)；首次发布以空快照为基准，
+        快照之后新登记的站 / 责任区按空基准（baseline_status=null）比较。
+        """
+        baseline_id, base_stations, base_zones = _load_baseline_snapshot(conn)
+        pending = _compute_pending_payload(conn)
+        now = iso_z(utc_now())
+
+        station_entries: list[dict[str, Any]] = []
+        zone_entries: list[dict[str, Any]] = []
+
+        def append_entry(
+            obj_id: int,
+            obj_name: str,
+            id_field: str,
+            name_field: str,
+            baseline: Optional[dict[str, Any]],
+            current: Optional[dict[str, Any]],
+            event_keys,
+        ) -> dict[str, Any]:
+            base_keys = event_keys(baseline) if baseline is not None else []
+            pending_keys = event_keys(current) if current is not None else []
+            added, disappeared = _diff_event_lists(base_keys, pending_keys)
+            entry = {
+                id_field: obj_id,
+                name_field: obj_name,
+                "baseline_status": baseline["status"] if baseline is not None else None,
+                "pending_status": current["status"] if current is not None else None,
+                "new_object": baseline is None,
+                "added_events": added,
+                "disappeared_events": disappeared,
+            }
+            (station_entries if id_field == "station_id" else zone_entries).append(entry)
+            return entry
+
+        pending_station_ids = {tl["station_id"] for tl in pending["stations"]}
+        for tl in pending["stations"]:
+            append_entry(
+                tl["station_id"], tl["station_name"], "station_id", "station_name",
+                base_stations.get(tl["station_id"]), tl, _station_event_keys,
+            )
+        # 防御：当前不存在但历史快照中有的站（现有接口无删除，一般不会出现）
+        for sid, base in base_stations.items():
+            if sid not in pending_station_ids:
+                append_entry(
+                    sid, base.get("station_name", str(sid)), "station_id", "station_name",
+                    base, None, _station_event_keys,
+                )
+
+        pending_zone_ids = {ztl["zone_id"] for ztl in pending["zones"]}
+        for ztl in pending["zones"]:
+            append_entry(
+                ztl["zone_id"], ztl["zone_name"], "zone_id", "zone_name",
+                base_zones.get(ztl["zone_id"]), ztl, _zone_event_keys,
+            )
+        for zid, base in base_zones.items():
+            if zid not in pending_zone_ids:
+                append_entry(
+                    zid, base.get("zone_name", str(zid)), "zone_id", "zone_name",
+                    base, None, _zone_event_keys,
+                )
+
+        def entry_changed(entry: dict[str, Any]) -> bool:
+            return (
+                entry["baseline_status"] != entry["pending_status"]
+                or bool(entry["added_events"])
+                or bool(entry["disappeared_events"])
+            )
+
+        added_event_count = sum(
+            len(e["added_events"]) for e in station_entries + zone_entries
+        )
+        disappeared_event_count = sum(
+            len(e["disappeared_events"]) for e in station_entries + zone_entries
+        )
+        new_station_ids = [e["station_id"] for e in station_entries if e["new_object"]]
+        new_zone_ids = [e["zone_id"] for e in zone_entries if e["new_object"]]
+
+        result = {
+            "baseline_publication_id": baseline_id,
+            "checked_at": now,
+            "stations": station_entries,
+            "zones": zone_entries,
+            "summary": {
+                "station_count": len(station_entries),
+                "zone_count": len(zone_entries),
+                "new_station_ids": new_station_ids,
+                "new_zone_ids": new_zone_ids,
+                "stations_changed": sum(1 for e in station_entries if entry_changed(e)),
+                "zones_changed": sum(1 for e in zone_entries if entry_changed(e)),
+                "added_event_count": added_event_count,
+                "disappeared_event_count": disappeared_event_count,
+                "has_changes": (
+                    bool(new_station_ids)
+                    or bool(new_zone_ids)
+                    or added_event_count > 0
+                    or disappeared_event_count > 0
+                    or any(e["baseline_status"] != e["pending_status"]
+                           for e in station_entries + zone_entries)
+                ),
+            },
+        }
+        return result, pending
+
     @app.post("/publish", status_code=201, tags=["发布"])
     def publish(body: Optional[PublishRequest] = None) -> dict[str, Any]:
         note = body.note if body else None
@@ -969,45 +1202,127 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "INSERT INTO publications(published_at, note) VALUES (?,?)", (now, note)
             )
             pub_id = cur.lastrowid
-            stations = conn.execute("SELECT id FROM stations ORDER BY id").fetchall()
-            summaries = []
-            for st in stations:
-                timeline = compute_timeline(conn, st["id"])
-                conn.execute(
-                    "INSERT INTO publication_timelines(publication_id, station_id, timeline_json) VALUES (?,?,?)",
-                    (pub_id, st["id"], json.dumps(timeline, ensure_ascii=False)),
-                )
-                summaries.append(
-                    {
-                        "station_id": st["id"],
-                        "station_name": timeline["station_name"],
-                        "status": timeline["status"],
-                        "event_count": len(timeline["events"]),
-                    }
-                )
-            # 发布时与各站时间线一同冻结责任区联动结果
-            zones = conn.execute("SELECT id FROM zones ORDER BY id").fetchall()
-            zone_summaries = []
-            for z in zones:
-                ztl = compute_zone_timeline(conn, z["id"])
-                conn.execute(
-                    "INSERT INTO publication_zones(publication_id, zone_id, timeline_json) VALUES (?,?,?)",
-                    (pub_id, z["id"], json.dumps(ztl, ensure_ascii=False)),
-                )
-                zone_summaries.append(
-                    {
-                        "zone_id": z["id"],
-                        "zone_name": ztl["zone_name"],
-                        "status": ztl["status"],
-                        "event_count": len(ztl["events"]),
-                    }
-                )
+            payload = _compute_pending_payload(conn)
+            station_summaries, zone_summaries = _freeze_payload(conn, pub_id, payload)
+            # 新发布本身使所有未确认凭证的“其他发布先完成”条件失效
+            db.bump_adjudication_version(conn)
         return {
             "publication_id": pub_id,
             "published_at": now,
             "note": note,
-            "stations": summaries,
+            "stations": station_summaries,
             "zones": zone_summaries,
+        }
+
+    @app.post("/publish/reconcile", status_code=201, tags=["发布"])
+    def publish_reconcile() -> dict[str, Any]:
+        """受控发布第一步：核对当前待发布裁定相对最新公开快照的变化。
+
+        - 返回基准发布编号（首次发布为 null）、各站/责任区状态的前后值、
+          按（对象、事件类型、发生时刻、出现次数）多重集比对的新增/消失事件，
+          以及一次性确认凭证 confirmation_token；
+        - 新登记对象以空基准比较（baseline_status=null，全部事件计入新增）；
+        - 核对不产生发布记录，也不改变待发布裁定；核对结果（含待发布内容指纹、
+          裁定数据版本、基准发布编号）随凭证落库，供确认时复核。
+        """
+        now = iso_z(utc_now())
+        token = secrets.token_urlsafe(24)
+        with db.write_tx() as conn:
+            result, pending_payload = _build_reconcile_result(conn)
+            conn.execute(
+                """
+                INSERT INTO release_confirmations(
+                    token, status, baseline_publication_id, adjudication_version,
+                    checked_at, result_json, pending_fingerprint)
+                VALUES (?, 'open', ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    result["baseline_publication_id"],
+                    db.adjudication_version(conn),
+                    now,
+                    json.dumps(result, ensure_ascii=False),
+                    _payload_fingerprint(pending_payload),
+                ),
+            )
+        return {**result, "confirmation_token": token}
+
+    @app.post("/publish/confirm", status_code=201, tags=["发布"])
+    def publish_confirm(body: PublishConfirmRequest) -> dict[str, Any]:
+        """受控发布第二步：凭核对凭证完成受控发布。
+
+        校验与冻结在**同一写事务**内完成：
+        - 凭证不存在 → 400（invalid_token）；凭证已成功使用 → 409（token_used）；
+        - 核对后发生过影响裁定的写入（站点/设备/读数补传或修订/阈值版本/责任区登记）
+          或有其他发布先完成（裁定版本推进 / 基准发布编号变化 / 待发布内容指纹变化）
+          → 409（拒绝，不生成发布记录、不改动凭证）；
+        - 成功时冻结内容与核对时的待发布结果一致，凭证置为 confirmed，只能使用一次。
+        """
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            token_row = conn.execute(
+                "SELECT * FROM release_confirmations WHERE token=?", (body.confirmation_token,)
+            ).fetchone()
+            if token_row is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason": "invalid_token", "message": "确认凭证无效"},
+                )
+            if token_row["status"] != "open":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "token_used",
+                        "message": "确认凭证已使用，不能重复确认",
+                        "publication_id": token_row["confirmed_publication_id"],
+                    },
+                )
+
+            latest_pub_id = conn.execute(
+                "SELECT MAX(id) AS id FROM publications"
+            ).fetchone()["id"]
+            pending_payload = _compute_pending_payload(conn)
+            current_fingerprint = _payload_fingerprint(pending_payload)
+            if (
+                db.adjudication_version(conn) != token_row["adjudication_version"]
+                or latest_pub_id != token_row["baseline_publication_id"]
+                or current_fingerprint != token_row["pending_fingerprint"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "stale_confirmation",
+                        "message": "核对后待发布裁定或基准发布已变化，凭证已失效，请重新核对",
+                        "baseline_publication_id": token_row["baseline_publication_id"],
+                        "checked_at": token_row["checked_at"],
+                    },
+                )
+
+            cur = conn.execute(
+                "INSERT INTO publications(published_at, note) VALUES (?,?)", (now, body.note)
+            )
+            pub_id = cur.lastrowid
+            station_summaries, zone_summaries = _freeze_payload(conn, pub_id, pending_payload)
+            conn.execute(
+                """
+                UPDATE release_confirmations
+                SET status='confirmed', note=?, confirmed_publication_id=?, confirmed_at=?
+                WHERE token=?
+                """,
+                (body.note, pub_id, now, body.confirmation_token),
+            )
+            # 发布完成，推进版本：使其他尚未确认的凭证随之失效
+            db.bump_adjudication_version(conn)
+            checked = json.loads(token_row["result_json"])
+
+        return {
+            "publication_id": pub_id,
+            "published_at": now,
+            "note": body.note,
+            "stations": station_summaries,
+            "zones": zone_summaries,
+            "confirmation_token": body.confirmation_token,
+            "baseline_publication_id": checked["baseline_publication_id"],
         }
 
     @app.get("/publications", tags=["发布"])

@@ -1,6 +1,6 @@
 # 山洪水位预警裁定服务
 
-基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整，**支持登记前不落库预演**）、按规则自动裁定预警与解除、审核修订并重算、**防汛责任区跨站联动预警**、发布冻结公开结果。
+基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整，**支持登记前不落库预演**）、按规则自动裁定预警与解除、审核修订并重算、**防汛责任区跨站联动预警**、发布冻结公开结果，以及值班员**受控发布（核对 → 确认两阶段，凭一次性凭证冻结）**。
 
 ## 一键启动
 
@@ -188,6 +188,84 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `POST /publish` 的响应、`GET /publications/{id}` 与 `GET /public/current` 在原有字段之外**新增** `zones` / `zone_timelines`（公开负载中均带 `published: true`）；原有字段与其他接口的请求响应保持不变。
 
+## 受控发布（值班员核对 → 确认两阶段）
+
+值班员发布前，必须先**核对**当前待发布裁定相对**最新公开快照**的变化，并凭核对返回的一次性**确认凭证**完成受控发布。直接调用 `POST /publish` 的原有一步发布方式保持兼容，但受控发布走下面两个接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/publish/reconcile` | 核对：相对最新公开快照计算差异，签发确认凭证（不产生发布记录） |
+| POST | `/publish/confirm` | 确认：`{confirmation_token, note?}` → 冻结并返回发布编号 |
+
+### 核对 `POST /publish/reconcile`
+
+- **基准**为最新一次发布（`baseline_publication_id`）；**首次发布**（尚无任何发布）以**空快照**为基准（`baseline_publication_id: null`）；基准快照之后**新登记**的监测站 / 责任区也按**空基准**比较（`new_object: true`、`baseline_status: null`，其全部事件计入新增）；
+- 逐站 / 逐责任区给出状态前后值 `baseline_status` / `pending_status`；
+- 事件差异按 **（对象、事件类型 `type`、发生时刻 `at`、出现次数 `occurrence_count`）** 的**多重集**比对：
+  - 单站事件的出现次数取触发事件的连续达阈值读数个数 `run_count`；
+  - 责任区事件每刻至多一个，出现次数取事件发生时仍在预警的成员站数 `warning_station_count`；
+  - 同一键出现多次则逐条列出，分别归入 `added_events`（新增）/ `disappeared_events`（消失）；
+- 响应附 `confirmation_token`，以及 `summary`（对象数、新增对象 ID、变化对象数、新增/消失事件总数、`has_changes`）；
+- 核对是只读计算 + 凭证登记，**不改变待发布裁定、不产生发布记录**；反复核对不会使先前的未确认凭证失效。
+
+响应示例（首次发布，站 1 已预警）：
+
+```json
+{
+  "baseline_publication_id": null,
+  "checked_at": "2026-10-03T03:46:27.120280Z",
+  "stations": [
+    {
+      "station_id": 1,
+      "station_name": "青石峡站",
+      "baseline_status": null,
+      "pending_status": "warning",
+      "new_object": true,
+      "added_events": [
+        {"type": "warning", "at": "2026-10-01T00:10:00Z", "occurrence_count": 3}
+      ],
+      "disappeared_events": []
+    }
+  ],
+  "zones": [],
+  "summary": {
+    "station_count": 1, "zone_count": 1,
+    "new_station_ids": [1], "new_zone_ids": [],
+    "stations_changed": 1, "zones_changed": 0,
+    "added_event_count": 1, "disappeared_event_count": 0,
+    "has_changes": true
+  },
+  "confirmation_token": "YGyzKfx6wzx_wpdHDhsZcj4SImVdcEzz"
+}
+```
+
+责任区条目字段同形：以 `zone_id` / `zone_name` 替代站字段，事件键中的“出现次数”为事件发生时预警成员站数。
+
+### 确认 `POST /publish/confirm`
+
+请求体 `{"confirmation_token": "...", "note": "可选备注"}`，成功 **201** 返回发布编号（响应与 `POST /publish` 同形，另附 `confirmation_token` 与 `baseline_publication_id`）。
+
+- **无效凭证**（不存在 / 为空）→ **400** `invalid_token`；
+- 凭证**已成功使用过** → **409** `token_used`（响应给出已生成的发布编号）；一个凭证**只能成功使用一次**；
+- 核对之后若发生**任何影响裁定的写入**——站点登记、设备登记、读数补传、读数作废/更正、阈值版本登记、责任区登记——或**有其他发布先完成**（`POST /publish` 或另一笔确认），确认返回 **409** `stale_confirmation`，**拒绝且不生成发布记录**，需重新核对后再确认；
+  - 幂等的同内容读数重试不改变裁定，不会使凭证失效；
+  - 阈值版本**预演**不落库，不影响凭证；
+- **凭证校验与冻结在同一写事务（`BEGIN IMMEDIATE`）内完成**：确认时会重新计算待发布内容，并同时复核①裁定数据版本号、②基准发布编号、③待发布冻结内容的 SHA-256 指纹，三者任一与核对时不符即拒绝；通过后冻结的内容**与核对时的待发布结果一致**；
+- 即使核对结果“无变化”也允许确认发布；**历史快照永不改写**，新发布只追加新编号。
+
+curl 速览：
+
+```bash
+# 1) 核对（无请求体），取出凭证
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/publish/reconcile \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirmation_token"])')
+
+# 2) 凭凭证确认发布（备注可选）
+curl -s -X POST http://127.0.0.1:8000/publish/confirm \
+  -H 'content-type: application/json' \
+  -d "{\"confirmation_token\":\"$TOKEN\",\"note\":\"值班员受控发布\"}"
+```
+
 ## API 一览
 
 ### 监测站与设备| 方法 | 路径 | 说明 |
@@ -232,14 +310,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/zones` / `/zones/{id}` | 查询责任区列表 / 配置 |
 | GET | `/zones/{id}/timeline` | 待发布跨站联动结果（实时重算） |
 | GET | `/public/zones/{id}/timeline` | 责任区最近一次发布冻结结果（无发布 404） |
-| POST | `/publish` | 发布：冻结全部监测站与责任区当前时间线 |
+| POST | `/publish/reconcile` | **受控发布·核对**：相对最新公开快照输出状态前后值与新增/消失事件，返回一次性确认凭证 |
+| POST | `/publish/confirm` | **受控发布·确认**：凭凭证冻结发布（无效 400；已用/核对后数据变化/被抢先发布 409） |
+| POST | `/publish` | 直接发布（兼容保留）：冻结全部监测站与责任区当前时间线 |
 | GET | `/publications` / `/publications/{id}` | 查询历史发布版本（含 `zone_timelines`） |
 | GET | `/public/current` | 最新发布的公开结果（含 `zone_timelines`） |
 | GET | `/public/stations/{id}/timeline` | 某站最新公开时间线 |
 
 ## 调用示例
 
-完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性**）：
+完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性** → **受控发布：核对差异/写入后确认拒绝/无效凭证 400/重新核对确认成功/凭证仅一次**）：
 
 ```bash
 ./examples/demo.sh            # 默认打 http://127.0.0.1:8000
@@ -296,6 +376,13 @@ curl http://127.0.0.1:8000/zones/1/timeline
 # 发布后查询冻结的公开结果（责任区尚无发布时返回 404）
 curl -X POST http://127.0.0.1:8000/publish
 curl http://127.0.0.1:8000/public/zones/1/timeline
+
+# 受控发布（值班员两步）：先核对拿凭证，再凭凭证确认
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/publish/reconcile \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirmation_token"])')
+curl -s -X POST http://127.0.0.1:8000/publish/confirm \
+  -H 'content-type: application/json' \
+  -d "{\"confirmation_token\":\"$TOKEN\",\"note\":\"值班员受控发布\"}"
 ```
 
 ## 并发与一致性设计
@@ -305,6 +392,7 @@ curl http://127.0.0.1:8000/public/zones/1/timeline
 - `threshold_versions(station_id, effective_at)` **唯一约束**保证同站生效时刻不重复（生效时间统一归一化为 UTC 存储，不同时区表示的同一时刻同样冲突）；
 - 责任区配置（`zones` / `zone_members`）只登记、不修改，区域联动结果在读取与发布时按成员站当前待发布时间线实时重算；发布在单事务内为全部监测站与责任区生成快照，公开结果读取的是冻结快照，与后续写入（含补传、审核修订、阈值调整）互不影响。
 - **阈值预演为纯只读操作**：在一次 `db.read()`（同一连接 + 进程内锁）内完成现状与预演的全部单站/责任区裁定，候选版本仅以内存中的虚拟行（临时 id `-1`）参与计算，不开启写事务、不产生任何数据库写入；因此预演期间拿到的现状/预演取自同一数据视图，且绝不会影响待发布查询与已冻结发布。
+- **受控发布的凭证失效判定**：`app_meta` 表维护单调递增的“裁定数据版本号”，站点/设备登记、读数补传（新增时）、作废/更正、阈值版本登记、责任区登记、发布都在各自写事务内推进该版本；核对时把版本号、基准发布编号、待发布冻结内容指纹连同凭证落库，确认在**同一 `BEGIN IMMEDIATE` 事务**内复核三者并完成冻结，配合进程内锁串行化，保证“校验与冻结原子完成、冻结内容与核对一致、凭证只成功一次”，并发确认恰有一笔成功。
 
 ## 测试
 
@@ -313,7 +401,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**阈值版本预演（同一校验/同刻 409 冲突、不落库不改待发布与冻结结果、本站与所属责任区现状/预演、其他成员站按待发布联动、同刻合并、与正式登记状态/事件类型/时刻一致）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、并发补传/发布不丢记录。
+覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**阈值版本预演（同一校验/同刻 409 冲突、不落库不改待发布与冻结结果、本站与所属责任区现状/预演、其他成员站按待发布联动、同刻合并、与正式登记状态/事件类型/时刻一致）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、并发补传/发布不丢记录、**受控发布（空快照首发与新对象空基准、状态前后值、按对象/类型/时刻/出现次数的新增与消失事件多重集比对、责任区出现次数、无效凭证 400、凭证仅一次 409、补传/作废/更正/阈值版本/责任区/设备/站点写入及其他发布后的拒绝、幂等重试不失效、冻结与核对一致、并发确认恰一笔成功）**。
 
 ## 项目结构
 
@@ -326,7 +414,7 @@ app/
   main.py           # FastAPI 路由与应用工厂
 tests/
   conftest.py       # 导入期重定向默认数据库，避免污染工作区
-  test_api.py       # 端到端测试（86 例）
+  test_api.py       # 端到端测试（102 例）
 examples/demo.sh    # 调用示例脚本
 Dockerfile / docker-compose.yml
 ```
